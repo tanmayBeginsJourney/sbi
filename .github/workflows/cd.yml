@@ -50,6 +50,15 @@ jobs:
       run: uv sync --locked --extra dev
 
     - name: Run the fast and the slow CPU tests with coverage
+      env:
+        # BENCHMARK ARM ONLY -- not for merge.
+        # ubuntu-latest is 4 vCPU; `-n auto` starts 4 xdist workers and torch then
+        # opens 4 intra-op threads per worker (~16 threads on 4 vCPU). Pinning to 1
+        # tests whether that contention explains the gap between the durations-based
+        # prediction (~17 min/shard) and the observed ~44 min median.
+        OMP_NUM_THREADS: 1
+        MKL_NUM_THREADS: 1
+        OPENBLAS_NUM_THREADS: 1
       # Shard the suite across runners with pytest-split, balanced by the
       # committed .test_durations (refreshed by refresh-test-durations.yml).
       run: uv run pytest -v -x -n auto -m "not gpu" --cov=sbi --cov-report=xml --junitxml=junit.xml -o junit_family=legacy --splitting-algorithm least_duration --splits ${{ matrix.split_size }} --group ${{ matrix.group_number }} tests/
