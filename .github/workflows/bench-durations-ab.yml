@@ -27,6 +27,10 @@ on:
         description: 'Replicate label (dispatch more than once for a second machine)'
         type: string
         default: '1'
+      smoke:
+        description: 'Smoke test: one tiny module, ~3 min, proves the plumbing works'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,10 +38,6 @@ permissions:
 defaults:
   run:
     shell: bash
-
-env:
-  # quarter of the suite, tutorials excluded (see header), balanced by committed durations
-  POP: -m "not gpu" --ignore=tests/tutorials_test.py --splitting-algorithm least_duration --splits 4 --group 1
 
 jobs:
   ab:
@@ -79,27 +79,63 @@ jobs:
 
     # A1: control
     - name: A1 record without coverage
-      continue-on-error: true
       run: |
         s=$(date +%s)
-        uv run pytest -n auto $POP --store-durations --durations-path dur_nocov1.json tests/ || true
+        # Flags inline, never via env: - `-m "not gpu"` in an env var gets
+        # word-split by the shell into -m '"not' and pytest rejects the marker.
+        # `|| true` keeps a FAILING TEST from truncating the recording (which is
+        # upstream's own intent) but must not hide pytest never starting - the
+        # verify step below is what catches that.
+        if [ "${{ inputs.smoke }}" = "true" ]; then
+          SEL=(tests/torchutils_test.py)
+        else
+          SEL=(--ignore=tests/tutorials_test.py --splitting-algorithm least_duration --splits 4 --group 1 tests/)
+        fi
+        uv run pytest -n auto -m "not gpu" --store-durations --durations-path dur_nocov1.json "${SEL[@]}" || true
         echo "a1_nocov_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
-
-    # B: treatment. --cov flags copied verbatim from cd.yml.
     - name: B record WITH coverage
-      continue-on-error: true
       run: |
         s=$(date +%s)
-        uv run pytest -n auto $POP --cov=sbi --cov-report=xml --store-durations --durations-path dur_cov.json tests/ || true
+        # Flags inline, never via env: - `-m "not gpu"` in an env var gets
+        # word-split by the shell into -m '"not' and pytest rejects the marker.
+        # `|| true` keeps a FAILING TEST from truncating the recording (which is
+        # upstream's own intent) but must not hide pytest never starting - the
+        # verify step below is what catches that.
+        if [ "${{ inputs.smoke }}" = "true" ]; then
+          SEL=(tests/torchutils_test.py)
+        else
+          SEL=(--ignore=tests/tutorials_test.py --splitting-algorithm least_duration --splits 4 --group 1 tests/)
+        fi
+        uv run pytest -n auto -m "not gpu" --cov=sbi --cov-report=xml --store-durations --durations-path dur_cov.json "${SEL[@]}" || true
         echo "b_cov_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
-
-    # A2: control repeated. A1 vs A2 IS the noise floor.
     - name: A2 record without coverage again
-      continue-on-error: true
       run: |
         s=$(date +%s)
-        uv run pytest -n auto $POP --store-durations --durations-path dur_nocov2.json tests/ || true
+        # Flags inline, never via env: - `-m "not gpu"` in an env var gets
+        # word-split by the shell into -m '"not' and pytest rejects the marker.
+        # `|| true` keeps a FAILING TEST from truncating the recording (which is
+        # upstream's own intent) but must not hide pytest never starting - the
+        # verify step below is what catches that.
+        if [ "${{ inputs.smoke }}" = "true" ]; then
+          SEL=(tests/torchutils_test.py)
+        else
+          SEL=(--ignore=tests/tutorials_test.py --splitting-algorithm least_duration --splits 4 --group 1 tests/)
+        fi
+        uv run pytest -n auto -m "not gpu" --store-durations --durations-path dur_nocov2.json "${SEL[@]}" || true
         echo "a2_nocov_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
+    - name: Verify every arm actually ran
+      # Three runs came back in 19 s / 22 s / 11 s with {} in every file and a green
+      # check, because `|| true` turned a rejected marker expression into success.
+      # Never again: assert each file holds a plausible number of tests.
+      run: |
+        min=$([ "${{ inputs.smoke }}" = "true" ] && echo 3 || echo 500)
+        fail=0
+        for f in dur_nocov1.json dur_cov.json dur_nocov2.json; do
+          n=$(python -c "import json;print(len(json.load(open('$f'))))" 2>/dev/null || echo 0)
+          echo "$f -> $n entries (need >= $min)"
+          [ "$n" -lt "$min" ] && fail=1
+        done
+        [ "$fail" -eq 0 ] || { echo "::error::an arm recorded no durations"; exit 1; }
 
     - name: Upload all three duration files
       if: ${{ !cancelled() }}
