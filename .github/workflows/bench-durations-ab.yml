@@ -1,0 +1,98 @@
+# BENCH ONLY - not for upstream. Measures whether recording .test_durations under
+# coverage changes the per-test numbers, and by how much per test.
+#
+# refresh-test-durations.yml records the file with:   pytest -n auto -m "not gpu"
+# cd.yml then consumes it with:                       pytest ... --cov=sbi --cov-report=xml
+#
+# So the schedule is built from timings taken without the instrumentation that the
+# scheduled run actually carries. This workflow runs both arms so the comparison is
+# same-day, same-fork, same runner pool - the committed .test_durations was recorded
+# on different machines two weeks earlier and is not a clean control.
+name: Bench durations A/B
+
+on:
+  workflow_dispatch:
+    inputs:
+      coverage:
+        description: 'Record with --cov (the CD-faithful arm)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  record:
+    name: Record durations (coverage=${{ inputs.coverage }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # 152-156 min without cov; allow ~1.5x plus slack
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: '3.12'
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      with:
+        enable-cache: true
+        cache-dependency-glob: "uv.lock"
+
+    - name: Install dependencies with uv
+      run: uv sync --locked --extra dev
+
+    - name: Rig provenance
+      run: |
+        {
+          echo "arm=${{ inputs.coverage && 'cov' || 'nocov' }}"
+          echo "run_id=${{ github.run_id }}"
+          echo "started_utc=$(date -u +%FT%TZ)"
+          echo "nproc=$(nproc)"
+          echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+          echo "mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')"
+          echo "commit=$(git rev-parse --short HEAD)"
+          echo "python=$(uv run python -c 'import sys;print(sys.version.split()[0])')"
+          echo "torch=$(uv run python -c 'import torch;print(torch.__version__)')"
+        } | tee provenance.txt
+
+    # The ONLY difference between the arms is the --cov flags, which are copied
+    # verbatim from cd.yml so the instrumented arm matches what CD really runs.
+    - name: Record test durations (no coverage)
+      if: ${{ !inputs.coverage }}
+      continue-on-error: true
+      run: |
+        s=$(date +%s)
+        uv run pytest -n auto -m "not gpu" --store-durations --durations-path .test_durations tests/ || true
+        echo "record_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
+
+    - name: Record test durations (WITH coverage, CD-faithful)
+      if: ${{ inputs.coverage }}
+      continue-on-error: true
+      run: |
+        s=$(date +%s)
+        uv run pytest -n auto -m "not gpu" --cov=sbi --cov-report=xml --store-durations --durations-path .test_durations tests/ || true
+        echo "record_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
+
+    - name: Ensure trailing newline
+      run: '[ -z "$(tail -c1 .test_durations)" ] || printf "\n" >> .test_durations'
+
+    # Artifact, never a PR: we want the file, and a bench run must not open PRs.
+    - name: Upload durations
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: durations-${{ inputs.coverage && 'cov' || 'nocov' }}-${{ github.run_id }}
+        path: |
+          .test_durations
+          provenance.txt
+        retention-days: 7
