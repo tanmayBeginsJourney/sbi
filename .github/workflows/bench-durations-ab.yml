@@ -1,22 +1,28 @@
-# BENCH ONLY - not for upstream. Measures whether recording .test_durations under
-# coverage changes the per-test numbers, and by how much per test.
+# BENCH ONLY - not for upstream.
 #
-# refresh-test-durations.yml records the file with:   pytest -n auto -m "not gpu"
-# cd.yml then consumes it with:                       pytest ... --cov=sbi --cov-report=xml
+# Q: does recording .test_durations under coverage change the per-test numbers,
+#    and is the change NON-UNIFORM across tests? (findings/F025)
 #
-# So the schedule is built from timings taken without the instrumentation that the
-# scheduled run actually carries. This workflow runs both arms so the comparison is
-# same-day, same-fork, same runner pool - the committed .test_durations was recorded
-# on different machines two weeks earlier and is not a clean control.
+# v1 of this workflow ran the two arms as separate jobs and was worthless: GitHub's
+# runner pool is heterogeneous, the control drew a Zen 3 EPYC 7763 and the treatment a
+# Zen 4 EPYC 9V74, and the newer chip more than swallowed the effect being measured
+# (naive ratio 0.80x against a predicted 1.1-1.2x). It also lost the durations file
+# entirely - upload-artifact skips dotfiles unless include-hidden-files is set.
+#
+# v2 fixes both: every arm runs in ONE job on ONE machine, and the arms are sandwiched
+# A-B-A so the repeated control measures this machine's own drift. A per-test cov/nocov
+# ratio only counts as signal if it clears that noise floor.
+#
+# Population is half the suite (pytest-split group 1 of 2) so three arms fit in one job.
 name: Bench durations A/B
 
 on:
   workflow_dispatch:
     inputs:
-      coverage:
-        description: 'Record with --cov (the CD-faithful arm)'
-        type: boolean
-        default: false
+      rep:
+        description: 'Replicate label (dispatch more than once for a second machine)'
+        type: string
+        default: '1'
 
 permissions:
   contents: read
@@ -25,11 +31,15 @@ defaults:
   run:
     shell: bash
 
+env:
+  # half the suite, balanced by the committed durations - representative and fits 3 arms
+  POP: -m "not gpu" --splitting-algorithm least_duration --splits 2 --group 1
+
 jobs:
-  record:
-    name: Record durations (coverage=${{ inputs.coverage }})
+  ab:
+    name: durations A-B-A (rep ${{ inputs.rep }})
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # 152-156 min without cov; allow ~1.5x plus slack
+    timeout-minutes: 350
 
     steps:
     - name: Checkout
@@ -54,45 +64,48 @@ jobs:
     - name: Rig provenance
       run: |
         {
-          echo "arm=${{ inputs.coverage && 'cov' || 'nocov' }}"
+          echo "rep=${{ inputs.rep }}"
           echo "run_id=${{ github.run_id }}"
           echo "started_utc=$(date -u +%FT%TZ)"
           echo "nproc=$(nproc)"
           echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
-          echo "mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')"
           echo "commit=$(git rev-parse --short HEAD)"
-          echo "python=$(uv run python -c 'import sys;print(sys.version.split()[0])')"
           echo "torch=$(uv run python -c 'import torch;print(torch.__version__)')"
         } | tee provenance.txt
 
-    # The ONLY difference between the arms is the --cov flags, which are copied
-    # verbatim from cd.yml so the instrumented arm matches what CD really runs.
-    - name: Record test durations (no coverage)
-      if: ${{ !inputs.coverage }}
+    # A1: control
+    - name: A1 record without coverage
       continue-on-error: true
       run: |
         s=$(date +%s)
-        uv run pytest -n auto -m "not gpu" --store-durations --durations-path .test_durations tests/ || true
-        echo "record_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
+        uv run pytest -n auto $POP --store-durations --durations-path dur_nocov1.json tests/ || true
+        echo "a1_nocov_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
 
-    - name: Record test durations (WITH coverage, CD-faithful)
-      if: ${{ inputs.coverage }}
+    # B: treatment. --cov flags copied verbatim from cd.yml.
+    - name: B record WITH coverage
       continue-on-error: true
       run: |
         s=$(date +%s)
-        uv run pytest -n auto -m "not gpu" --cov=sbi --cov-report=xml --store-durations --durations-path .test_durations tests/ || true
-        echo "record_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
+        uv run pytest -n auto $POP --cov=sbi --cov-report=xml --store-durations --durations-path dur_cov.json tests/ || true
+        echo "b_cov_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
 
-    - name: Ensure trailing newline
-      run: '[ -z "$(tail -c1 .test_durations)" ] || printf "\n" >> .test_durations'
+    # A2: control repeated. A1 vs A2 IS the noise floor.
+    - name: A2 record without coverage again
+      continue-on-error: true
+      run: |
+        s=$(date +%s)
+        uv run pytest -n auto $POP --store-durations --durations-path dur_nocov2.json tests/ || true
+        echo "a2_nocov_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
 
-    # Artifact, never a PR: we want the file, and a bench run must not open PRs.
-    - name: Upload durations
+    - name: Upload all three duration files
       if: ${{ !cancelled() }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: durations-${{ inputs.coverage && 'cov' || 'nocov' }}-${{ github.run_id }}
+        name: durations-aba-rep${{ inputs.rep }}-${{ github.run_id }}
+        include-hidden-files: true
         path: |
-          .test_durations
+          dur_nocov1.json
+          dur_cov.json
+          dur_nocov2.json
           provenance.txt
         retention-days: 7
