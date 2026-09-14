@@ -13,7 +13,11 @@
 # A-B-A so the repeated control measures this machine's own drift. A per-test cov/nocov
 # ratio only counts as signal if it clears that noise floor.
 #
-# Population is half the suite (pytest-split group 1 of 2) so three arms fit in one job.
+# Population is a quarter of the suite with tutorials_test.py excluded. The exclusion
+# matters: those 5 notebook tests are 43 min of the suite but only 5 data points, and
+# they run the notebook in a subprocess where coverage of sbi/ barely applies - so they
+# cost a third of the runtime and tell us almost nothing about per-test overhead.
+# What is left is ~1800 dense, comparable tests and a ~105 min job.
 name: Bench durations A/B
 
 on:
@@ -32,14 +36,14 @@ defaults:
     shell: bash
 
 env:
-  # half the suite, balanced by the committed durations - representative and fits 3 arms
-  POP: -m "not gpu" --splitting-algorithm least_duration --splits 2 --group 1
+  # quarter of the suite, tutorials excluded (see header), balanced by committed durations
+  POP: -m "not gpu" --ignore=tests/tutorials_test.py --splitting-algorithm least_duration --splits 4 --group 1
 
 jobs:
   ab:
     name: durations A-B-A (rep ${{ inputs.rep }})
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 240
 
     steps:
     - name: Checkout
