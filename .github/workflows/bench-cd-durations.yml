@@ -1,0 +1,114 @@
+# BENCH ONLY - not for upstream.
+#
+# Q: what do the tests actually cost UNDER CD CONDITIONS - sharded, 2 workers, with
+#    --cov - as opposed to the committed .test_durations, which refresh-test-durations.yml
+#    records unsharded and WITHOUT --cov?
+#
+# Two things ride on this:
+#   1. #1424 asks which tests are slowest. Answering from .test_durations answers it for
+#      a different configuration than the one that takes an hour.
+#   2. Group 2 runs ~20 min above the makespan a 2-worker packing model predicts, and
+#      nothing measured so far explains it. Per-test CD timings should show which tests
+#      in that group exceed their recorded durations.
+#
+# Design notes:
+#   - Flags copied from cd.yml, with ONE deliberate deviation: `-x` is dropped. With -x a
+#     single flaky c2st failure truncates the run and the tail data is lost. When nothing
+#     fails, dropping it changes no timing.
+#   - TWO Python versions x 4 groups = 8 jobs. The second version is a replicate: per-test
+#     numbers without a noise estimate are how this investigation went wrong before.
+#   - --store-durations writes only the tests THIS session ran (pytest_split builds it
+#     from terminalreporter.stats), so each group job emits its own file.
+name: Bench CD durations
+
+on:
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: 'Smoke test: one tiny module, ~3 min, proves the plumbing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  cd_durations:
+    name: CD durations (py${{ matrix.python-version }} g${{ matrix.group_number }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+        group_number: [1, 2, 3, 4]
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      with:
+        enable-cache: true
+        cache-dependency-glob: "uv.lock"
+
+    - name: Install dependencies with uv
+      run: uv sync --locked --extra dev
+
+    - name: Rig provenance
+      run: |
+        {
+          echo "py=${{ matrix.python-version }}"
+          echo "group=${{ matrix.group_number }}"
+          echo "run_id=${{ github.run_id }}"
+          echo "started_utc=$(date -u +%FT%TZ)"
+          echo "nproc=$(nproc)"
+          echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+          echo "commit=$(git rev-parse --short HEAD)"
+        } | tee provenance.txt
+
+    - name: Run the CD shard and record per-test durations
+      run: |
+        s=$(date +%s)
+        if [ "${{ inputs.smoke }}" = "true" ]; then
+          SEL=(tests/torchutils_test.py)
+        else
+          SEL=(--splitting-algorithm least_duration --splits 4 --group ${{ matrix.group_number }} tests/)
+        fi
+        uv run pytest -v -n auto -m "not gpu" --cov=sbi --cov-report=xml --junitxml=junit.xml -o junit_family=legacy --durations=0 --store-durations --durations-path dur_cd_g${{ matrix.group_number }}.json "${SEL[@]}" 2>&1 | tee pytest_output.txt || true
+        echo "run_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
+        grep -o "created: [0-9]*/[0-9]* workers" pytest_output.txt | head -1 | tee -a provenance.txt
+
+    - name: Verify the shard actually ran
+      # A green check with an empty durations file has happened here before. Assert the
+      # OUTPUT, never the exit status.
+      run: |
+        min=$([ "${{ inputs.smoke }}" = "true" ] && echo 3 || echo 500)
+        f=dur_cd_g${{ matrix.group_number }}.json
+        n=$(python -c "import json;print(len(json.load(open('$f'))))" 2>/dev/null || echo 0)
+        echo "$f -> $n entries (need >= $min)"
+        [ "$n" -ge "$min" ] || { echo "::error::shard recorded no durations"; exit 1; }
+
+    - name: Upload
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: cddur-py${{ matrix.python-version }}-g${{ matrix.group_number }}-${{ github.run_id }}
+        include-hidden-files: true
+        path: |
+          dur_cd_g${{ matrix.group_number }}.json
+          provenance.txt
+          pytest_output.txt
+        retention-days: 7
