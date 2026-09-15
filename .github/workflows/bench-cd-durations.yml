@@ -17,8 +17,13 @@
 #     fails, dropping it changes no timing.
 #   - TWO Python versions x 4 groups = 8 jobs. The second version is a replicate: per-test
 #     numbers without a noise estimate are how this investigation went wrong before.
-#   - --store-durations writes only the tests THIS session ran (pytest_split builds it
-#     from terminalreporter.stats), so each group job emits its own file.
+#   - DO NOT pass --durations-path. pytest_split uses that ONE option for both reading
+#     and writing (plugin.py line 127 reads, 221 writes). v1 of this passed it to name
+#     the output file, so pytest-split tried to READ a file that did not exist yet, every
+#     test fell back to the imputed average, and the split silently degenerated to
+#     round-robin - vector_field_nets_test.py came out 768/768/769/768 across groups.
+#     The per-test timings were still valid; the GROUPING was not CD's grouping.
+#     Per-test durations therefore come from parsing --durations=0 out of the log.
 name: Bench CD durations
 
 on:
@@ -87,7 +92,7 @@ jobs:
         else
           SEL=(--splitting-algorithm least_duration --splits 4 --group ${{ matrix.group_number }} tests/)
         fi
-        uv run pytest -v -n auto -m "not gpu" --cov=sbi --cov-report=xml --junitxml=junit.xml -o junit_family=legacy --durations=0 --store-durations --durations-path dur_cd_g${{ matrix.group_number }}.json "${SEL[@]}" 2>&1 | tee pytest_output.txt || true
+        uv run pytest -v -n auto -m "not gpu" --cov=sbi --cov-report=xml --junitxml=junit.xml -o junit_family=legacy --durations=0 "${SEL[@]}" 2>&1 | tee pytest_output.txt || true
         echo "run_seconds=$(( $(date +%s) - s ))" | tee -a provenance.txt
         grep -o "created: [0-9]*/[0-9]* workers" pytest_output.txt | head -1 | tee -a provenance.txt
 
@@ -96,10 +101,12 @@ jobs:
       # OUTPUT, never the exit status.
       run: |
         min=$([ "${{ inputs.smoke }}" = "true" ] && echo 3 || echo 500)
-        f=dur_cd_g${{ matrix.group_number }}.json
-        n=$(python -c "import json;print(len(json.load(open('$f'))))" 2>/dev/null || echo 0)
-        echo "$f -> $n entries (need >= $min)"
-        [ "$n" -ge "$min" ] || { echo "::error::shard recorded no durations"; exit 1; }
+        n=$(grep -cE "^[0-9.]+s (call|setup|teardown) " pytest_output.txt || echo 0)
+        echo "duration lines in log -> $n (need >= $min)"
+        [ "$n" -ge "$min" ] || { echo "::error::shard produced no duration lines"; exit 1; }
+        # The split must be the REAL one. If pytest-split had no durations it would fall
+        # back to round-robin, which shows up as a suspiciously even per-file spread.
+        grep -E "^[0-9.]+s call " pytest_output.txt | head -3
 
     - name: Upload
       if: ${{ !cancelled() }}
@@ -108,7 +115,6 @@ jobs:
         name: cddur-py${{ matrix.python-version }}-g${{ matrix.group_number }}-${{ github.run_id }}
         include-hidden-files: true
         path: |
-          dur_cd_g${{ matrix.group_number }}.json
           provenance.txt
           pytest_output.txt
         retention-days: 7
