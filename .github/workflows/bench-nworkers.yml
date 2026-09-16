@@ -1,0 +1,118 @@
+# BENCH ONLY - not for upstream.
+#
+# Q: `-n auto` resolves to 2 workers on these runners (nproc=4, xdist counts PHYSICAL
+#    cores, and a 4-vCPU runner is 2 physical cores with SMT). Does `-n 4` beat it?
+#
+# Either answer is a result. More workers on 4 logical CPUs may contend, especially with
+# torch intra-op threads left unpinned.
+#
+# Design rules, each one paid for by a failed experiment earlier in this investigation:
+#   - ALL arms in ONE job. GitHub's runner pool is heterogeneous; three separate
+#     comparisons here were destroyed by arms landing on different CPU generations.
+#   - A-B-A. The repeated control measures this machine's own drift, so an arm
+#     difference smaller than the drift is not reported as a result.
+#   - NO --durations-path. pytest_split uses that one option for reading AND writing,
+#     so naming an output file makes it read a missing one and the split silently
+#     degenerates to round-robin.
+#   - No `cmd | head` in a step. head closes the pipe, the producer takes SIGPIPE and
+#     exits 141, and Actions runs bash -e, so the step fails on a diagnostic line.
+#   - Verify the OUTPUT, never the exit status.
+#   - Record pass/fail counts per arm. A speedup that changes test outcomes is not a
+#     speedup - that is what disqualified thread pinning.
+name: Bench n-workers
+
+on:
+  workflow_dispatch:
+    inputs:
+      rep:
+        description: 'Replicate label (dispatch twice for a second machine)'
+        type: string
+        default: '1'
+      smoke:
+        description: 'Smoke test: one tiny module, ~4 min'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  nworkers:
+    name: n-workers A-B-A (rep ${{ inputs.rep }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: '3.12'
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      with:
+        enable-cache: true
+        cache-dependency-glob: "uv.lock"
+
+    - name: Install dependencies with uv
+      run: uv sync --locked --extra dev
+
+    - name: Rig provenance
+      run: |
+        {
+          echo "rep=${{ inputs.rep }}"
+          echo "run_id=${{ github.run_id }}"
+          echo "started_utc=$(date -u +%FT%TZ)"
+          echo "nproc=$(nproc)"
+          echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+          echo "commit=$(git rev-parse --short HEAD)"
+        } | tee provenance.txt
+
+    - name: A1  -n auto   (control)
+      env:
+        SMOKE: ${{ inputs.smoke }}
+      run: bash bench_arm.sh a1_auto auto
+
+    - name: B   -n 4      (treatment)
+      env:
+        SMOKE: ${{ inputs.smoke }}
+      run: bash bench_arm.sh b_n4 4
+
+    - name: A2  -n auto   (control repeated, measures machine drift)
+      env:
+        SMOKE: ${{ inputs.smoke }}
+      run: bash bench_arm.sh a2_auto auto
+
+    - name: Verify all three arms ran
+      run: |
+        fail=0
+        for a in a1_auto b_n4 a2_auto; do
+          secs=$(grep -m1 "^${a}_seconds=" provenance.txt | cut -d= -f2)
+          tests=$(grep -m1 "^${a}_tests=" provenance.txt | cut -d= -f2)
+          secs=${secs:-0}; tests=${tests:-0}
+          min=$([ "${{ inputs.smoke }}" = "true" ] && echo 3 || echo 500)
+          echo "$a: ${secs}s, ${tests} tests reported"
+          if [ "$tests" -lt "$min" ]; then fail=1; fi
+        done
+        [ "$fail" -eq 0 ] || { echo "::error::an arm did not run the suite"; exit 1; }
+        cat provenance.txt
+
+    - name: Upload
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: nworkers-rep${{ inputs.rep }}-${{ github.run_id }}
+        include-hidden-files: true
+        path: |
+          provenance.txt
+          out_*.txt
+        retention-days: 7
